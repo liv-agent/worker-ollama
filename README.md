@@ -179,6 +179,8 @@ Non-streaming responses return Ollama's native response object:
 | `OLLAMA_KEEP_ALIVE` | `-1` (forever) | How long models stay loaded in VRAM |
 | `OLLAMA_LOAD_TIMEOUT` | `60m` | How long Ollama waits for a model to load into memory before failing the request. Ollama's own default is `5m`, which a large model on a fresh worker can exceed |
 
+**Boot warm-up:** after registering the configured model, the worker loads it into GPU memory before accepting jobs (an empty-prompt `/api/generate`, bounded by `OLLAMA_LOAD_TIMEOUT`). Registering only writes the model to disk — Ollama loads VRAM lazily on the first inference — so without the warm-up the *first user request* pays the multi-minute load and can hit the execution timeout. With `OLLAMA_KEEP_ALIVE=-1` the weights then stay resident for the worker's lifetime. If the warm-up fails, the worker logs the cause and still starts; the first request retries the load.
+
 ## Storage and disk sizing
 
 | Configuration | Ollama store | GGUF acquisition | Disk needed |
