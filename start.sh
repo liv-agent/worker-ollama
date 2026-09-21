@@ -92,11 +92,15 @@ fi
 
 # Always runs: resolve_default_model has a fallback, so there is always a model to
 # prepare. ensure_default_model resolves HF_MODEL over OLLAMA_MODEL, reads Runpod's
-# model store first, and uses HF_TOKEN for gated repos.
-if /opt/venv/bin/python -c 'import handler; print("Model ready:", handler.ensure_default_model())'; then
+# model store first, and uses HF_TOKEN for gated repos. warm_default_model then
+# loads the weights into GPU memory: registering only writes the model to disk,
+# and without the warm-up the *first user request* pays the multi-minute VRAM
+# load and can blow the execution timeout. Warm-up failure is non-fatal (the
+# handler retries the load on the first request) and logs its own cause.
+if /opt/venv/bin/python -c 'import handler; print("Model ready:", handler.ensure_default_model()); handler.warm_default_model()'; then
     :
 else
-    echo "WARN: startup model preparation failed — the handler will retry on the first request"
+    echo "WARN: startup model preparation failed (cause in the traceback above) — the handler will retry on the first request, which will be slow and may time out"
 fi
 
 cd /

@@ -3,6 +3,7 @@ import json
 import os
 import re
 import subprocess
+import time
 import uuid
 
 import requests
@@ -850,6 +851,136 @@ def ensure_default_model():
     else:
         ensure_model(model)
     return model
+
+
+# Go-style durations, which is what Ollama's env vars use. "ms" before "m" so
+# "500ms" doesn't half-match as "500m" plus a dangling "s".
+_DURATION_RE = re.compile(r"^([+-]?)((?:\d+(?:\.\d+)?(?:ms|us|ns|h|m|s))+)$")
+_DURATION_PART_RE = re.compile(r"(\d+(?:\.\d+)?)(ms|us|ns|h|m|s)")
+_UNIT_SECONDS = {"h": 3600.0, "m": 60.0, "s": 1.0, "ms": 1e-3, "us": 1e-6, "ns": 1e-9}
+
+# Fallback and cap for the warm-up bound: never let boot hang on a load forever,
+# even when OLLAMA_LOAD_TIMEOUT is unset, unparseable, or "retry indefinitely".
+_WARMUP_FALLBACK_S = 3600.0
+# Client-side margin over Ollama's own load timeout, so the server's error — which
+# says *why* the load failed — wins the race against a blank client timeout.
+_WARMUP_MARGIN_S = 60.0
+
+
+def _duration_seconds(value, default):
+    """Parse a Go time.ParseDuration string ('60m', '1h30m', '90s') to seconds.
+
+    Ollama parses OLLAMA_LOAD_TIMEOUT with Go's parser; mirroring it here keeps
+    one env var meaning one thing. Unparseable values return `default` rather
+    than raising — a bad env var must not break boot.
+    """
+    match = _DURATION_RE.match((value or "").strip().lower())
+    if not match:
+        return default
+    total = sum(
+        float(number) * _UNIT_SECONDS[unit]
+        for number, unit in _DURATION_PART_RE.findall(match.group(2))
+    )
+    return -total if match.group(1) == "-" else total
+
+
+def _warmup_timeout_seconds():
+    """How long the boot warm-up may spend loading the model into memory.
+
+    Ollama itself gives up after OLLAMA_LOAD_TIMEOUT (its default is 5m; this
+    image's Hub default is 60m; non-positive means retry forever), so the client
+    bound sits just above that: Ollama's load-timeout error names the model and
+    the cause, which beats a mute client-side timeout. Non-positive or
+    unparseable values are capped at an hour so warm-up is never unbounded.
+    """
+    timeout = _duration_seconds(os.environ.get("OLLAMA_LOAD_TIMEOUT"), _WARMUP_FALLBACK_S)
+    if timeout <= 0:
+        timeout = _WARMUP_FALLBACK_S
+    return timeout + _WARMUP_MARGIN_S
+
+
+def _report_residency(model):
+    """Log where the loaded weights actually ended up (VRAM vs CPU spill).
+
+    /api/ps is the only place Ollama reports size_vram; a partial-VRAM load is
+    the "first request is mysteriously slow" case worth flagging at boot.
+    """
+    response = session.get(f"{OLLAMA_BASE_URL}/api/ps", timeout=30)
+    if not response.ok:
+        return
+    for entry in response.json().get("models", []):
+        if entry.get("name") not in (model, f"{model}:latest"):
+            continue
+        size = entry.get("size") or 0
+        vram = entry.get("size_vram") or 0
+        if size and vram < size:
+            print(
+                f"WARN: '{model}' loaded, but only {_human_size(vram)} of "
+                f"{_human_size(size)} fits in VRAM — the rest is offloaded to CPU and "
+                f"responses will be much slower. Pick a GPU with more VRAM, a smaller "
+                f"quantization via HF_QUANTIZATION, or a lower OLLAMA_CONTEXT_LENGTH.",
+                flush=True,
+            )
+        else:
+            print(f"'{model}' is resident in GPU memory ({_human_size(vram)})", flush=True)
+        return
+    print(f"WARN: '{model}' answered the warm-up but is not listed by /api/ps", flush=True)
+
+
+def warm_model(model):
+    """Load `model`'s weights into GPU memory before any user request arrives.
+
+    Registering a model (ensure_default_model) only writes it to disk — Ollama
+    loads weights into VRAM lazily, on the first inference. Without this, the
+    first user request pays the whole multi-minute load and can blow the
+    endpoint's execution timeout. An empty prompt is Ollama's documented
+    "just load it" request: no tokens are generated, and the image's
+    OLLAMA_KEEP_ALIVE=-1 default keeps the weights resident afterwards.
+    """
+    timeout = _warmup_timeout_seconds()
+    print(
+        f"Loading '{model}' into GPU memory (bounded at {int(timeout)}s "
+        f"by OLLAMA_LOAD_TIMEOUT)...",
+        flush=True,
+    )
+    started = time.monotonic()
+    response = session.post(
+        f"{OLLAMA_BASE_URL}/api/generate",
+        json={"model": model, "prompt": "", "stream": False},
+        timeout=timeout,
+    )
+    error = ollama_error(response)
+    if error:
+        raise ValueError(error)
+    print(f"Loaded '{model}' in {time.monotonic() - started:.1f}s", flush=True)
+    try:
+        _report_residency(model)
+    except (requests.RequestException, ValueError) as err:
+        print(f"WARN: could not read /api/ps after warming '{model}': {err}", flush=True)
+
+
+def warm_default_model():
+    """Best-effort boot-time warm-up of the model the endpoint is configured for.
+
+    Deliberately non-fatal: the model is already registered, so the handler still
+    works if this fails — the first request just pays the load, as it did before
+    warm-up existed. But say exactly what failed, so "too big for this GPU" or
+    "load timed out" is diagnosable from the boot log instead of from a timed-out
+    first request. Returns True when the model is warm.
+    """
+    model = resolve_default_model()
+    if not model:
+        return False
+    try:
+        warm_model(model)
+        return True
+    except (requests.RequestException, ValueError, OSError) as err:
+        print(
+            f"WARN: could not pre-load '{model}' into GPU memory — the first request "
+            f"will trigger the load instead and may be slow or time out. Cause: {err}",
+            flush=True,
+        )
+        return False
 
 
 def handler(job):
